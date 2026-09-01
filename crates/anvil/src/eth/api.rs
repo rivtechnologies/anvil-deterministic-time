@@ -159,6 +159,8 @@ pub struct EthApi<N: Network> {
     transaction_order: Arc<RwLock<TransactionOrder>>,
     /// Whether we're listening for RPC calls
     net_listening: bool,
+    /// Whether CPU-heavy work is offloaded to Tokio's blocking pool.
+    offload_blocking_tasks: bool,
     /// The instance ID. Changes on every reset.
     instance_id: Arc<RwLock<B256>>,
     /// Serializes endpoint identity reads with reset transitions.
@@ -181,6 +183,7 @@ impl<N: Network> Clone for EthApi<N> {
             filters: self.filters.clone(),
             transaction_order: self.transaction_order.clone(),
             net_listening: self.net_listening,
+            offload_blocking_tasks: self.offload_blocking_tasks,
             instance_id: self.instance_id.clone(),
             lifecycle_lock: self.lifecycle_lock.clone(),
             reset_lock: self.reset_lock.clone(),
@@ -215,11 +218,17 @@ impl<N: Network> EthApi<N> {
             logger,
             filters,
             net_listening: true,
+            offload_blocking_tasks: true,
             transaction_order: Arc::new(RwLock::new(transactions_order)),
             instance_id: Arc::new(RwLock::new(B256::random())),
             lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             reset_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub(crate) const fn with_blocking_task_offloading(mut self, enabled: bool) -> Self {
+        self.offload_blocking_tasks = enabled;
+        self
     }
 
     /// Returns the current gas price
@@ -659,6 +668,10 @@ impl<N: Network> EthApi<N> {
         F: Future<Output = Result<R>> + Send + 'static,
         R: Send + 'static,
     {
+        if !self.offload_blocking_tasks {
+            return c(self.clone()).await;
+        }
+
         let (tx, rx) = oneshot::channel();
         let this = self.clone();
         let f = c(this);
@@ -2946,19 +2959,23 @@ impl EthApi<FoundryNetwork> {
         };
         let raw = service_encoded.map(Bytes::from).unwrap_or(tx);
 
-        let transaction = if raw.first() == Some(&EIP4844_TX_TYPE_ID) {
-            // Pooled EIP-4844 decoding uses large stack frames for inline blobs. Isolate it from
-            // the already-large RPC dispatcher without increasing every worker's stack.
-            let raw = raw.clone();
-            tokio::task::spawn_blocking(move || FoundryTxEnvelope::decode_2718(&mut raw.as_ref()))
+        let transaction =
+            if raw.first() == Some(&EIP4844_TX_TYPE_ID) && self.offload_blocking_tasks {
+                // Pooled EIP-4844 decoding uses large stack frames for inline blobs. Isolate it
+                // from the already-large RPC dispatcher without increasing every
+                // worker's stack.
+                let raw = raw.clone();
+                tokio::task::spawn_blocking(move || {
+                    FoundryTxEnvelope::decode_2718(&mut raw.as_ref())
+                })
                 .await
                 .map_err(|_| {
                     BlockchainError::Internal("transaction decoding task panicked".into())
                 })?
-        } else {
-            FoundryTxEnvelope::decode_2718(&mut raw.as_ref())
-        }
-        .map_err(|_| BlockchainError::FailedToDecodeSignedTransaction)?;
+            } else {
+                FoundryTxEnvelope::decode_2718(&mut raw.as_ref())
+            }
+            .map_err(|_| BlockchainError::FailedToDecodeSignedTransaction)?;
 
         self.ensure_typed_transaction_supported(&transaction)?;
 

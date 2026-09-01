@@ -56,12 +56,13 @@ where
         miner: Miner<N::TxEnvelope>,
         fee_history: FeeHistoryService<N>,
         filters: Filters<N>,
+        offload_blocking_tasks: bool,
     ) -> Self {
         let start = tokio::time::Instant::now() + filters.keep_alive();
         let filter_eviction_interval = tokio::time::interval_at(start, filters.keep_alive());
         Self {
             pool,
-            block_producer: BlockProducer::new(backend),
+            block_producer: BlockProducer::new(backend, offload_blocking_tasks),
             miner,
             fee_history,
             filter_eviction_interval,
@@ -141,6 +142,8 @@ struct BlockProducer<N: Network> {
     block_mining: Option<JoinHandle<MiningResult<N>>>,
     /// backlog of sets of transactions ready to be mined
     queued: VecDeque<crate::eth::miner::MiningWork<N::TxEnvelope>>,
+    /// Whether mining is offloaded to Tokio's blocking pool.
+    offload_blocking_tasks: bool,
 }
 
 impl<N: Network> BlockProducer<N>
@@ -148,8 +151,13 @@ where
     Backend<N>: TransactionValidator<N::TxEnvelope>,
     N: Network<TxEnvelope = FoundryTxEnvelope, ReceiptEnvelope = FoundryReceiptEnvelope>,
 {
-    fn new(backend: Arc<Backend<N>>) -> Self {
-        Self { idle_backend: Some(backend), block_mining: None, queued: Default::default() }
+    fn new(backend: Arc<Backend<N>>, offload_blocking_tasks: bool) -> Self {
+        Self {
+            idle_backend: Some(backend),
+            block_mining: None,
+            queued: Default::default(),
+            offload_blocking_tasks,
+        }
     }
 
     fn is_idle(&self) -> bool {
@@ -173,19 +181,22 @@ where
                 let work = pin.queued.pop_front().expect("not empty; qed");
                 let generation = work.generation;
 
-                // we spawn this on as blocking task because this can be blocking for a while in
-                // forking mode, because of all the rpc calls to fetch the required state
-                let handle = tokio::runtime::Handle::current();
-                let mining = tokio::task::spawn_blocking(move || {
-                    handle.block_on(async move {
-                        trace!(target: "miner", "creating new block");
-                        let block = backend.mine_block(work.transactions).await;
-                        if let Ok(block) = &block {
-                            trace!(target: "miner", "created new block: {}", block.block_number);
-                        }
-                        (block, backend, generation)
-                    })
-                });
+                // Fork-mode state reads can block; embedders may keep mining on the current
+                // runtime when its scheduler must retain control.
+                let task = async move {
+                    trace!(target: "miner", "creating new block");
+                    let block = backend.mine_block(work.transactions).await;
+                    if let Ok(block) = &block {
+                        trace!(target: "miner", "created new block: {}", block.block_number);
+                    }
+                    (block, backend, generation)
+                };
+                let mining = if pin.offload_blocking_tasks {
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || handle.block_on(task))
+                } else {
+                    tokio::task::spawn(task)
+                };
                 pin.block_mining = Some(mining);
             }
         }

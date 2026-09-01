@@ -3,12 +3,34 @@
 use crate::eth::error::BlockchainError;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
+
+/// Provides the current wall-clock time to the node.
+///
+/// Every timestamp the node derives (block timestamps, call timestamps, time offsets and the
+/// genesis fallback) is read through this trait, so embedders can replace the system clock with a
+/// simulated one for deterministic simulation testing via
+/// [`NodeConfig::with_clock`](crate::NodeConfig::with_clock).
+pub trait ClockSource: fmt::Debug + Send + Sync {
+    /// Returns the current duration since the unix epoch.
+    fn duration_since_unix_epoch(&self) -> Duration;
+}
+
+/// The default [`ClockSource`], backed by [`std::time::SystemTime`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl ClockSource for SystemClock {
+    fn duration_since_unix_epoch(&self) -> Duration {
+        duration_since_unix_epoch()
+    }
+}
 
 /// Manages block time
 #[derive(Clone, Debug)]
 pub struct TimeManager {
     state: Arc<RwLock<TimeState>>,
+    clock: Arc<dyn ClockSource>,
 }
 
 /// Timestamp controls that must be read and committed atomically.
@@ -48,7 +70,12 @@ pub(crate) struct PendingTimeIncrease {
 
 impl TimeManager {
     pub fn new(start_timestamp: u64) -> Self {
-        let time_manager = Self { state: Default::default() };
+        Self::with_clock(start_timestamp, Arc::new(SystemClock))
+    }
+
+    /// Creates a new time manager that reads the current time from the given clock.
+    pub fn with_clock(start_timestamp: u64, clock: Arc<dyn ClockSource>) -> Self {
+        let time_manager = Self { state: Default::default(), clock };
         time_manager.reset(start_timestamp);
         time_manager
     }
@@ -65,7 +92,7 @@ impl TimeManager {
     }
 
     fn reset_timestamp(&self, start_timestamp: u64, mark_new_head: bool) {
-        let current = duration_since_unix_epoch();
+        let current = self.clock.duration_since_unix_epoch();
         let mut state = self.state.write();
         state.last_timestamp = start_timestamp;
         if mark_new_head {
@@ -88,8 +115,8 @@ impl TimeManager {
 
     /// Records that a new latest block was created.
     pub(crate) fn mark_block_created(&self) {
-        self.state.write().last_block_wall_time =
-            duration_since_unix_epoch().as_millis().try_into().unwrap_or(u64::MAX);
+        let now = self.clock.duration_since_unix_epoch();
+        self.state.write().last_block_wall_time = now.as_millis().try_into().unwrap_or(u64::MAX);
     }
 
     /// Adds the given `offset` to the already tracked offset and returns the result
@@ -188,7 +215,7 @@ impl TimeManager {
 
     /// Prepares the next timestamp without consuming a one-shot override.
     pub(crate) fn prepare_next_timestamp(&self) -> PendingBlockTimestamp {
-        let current = duration_since_unix_epoch().as_secs() as i128;
+        let current = self.clock.duration_since_unix_epoch().as_secs() as i128;
         let state = self.state.read();
         let (timestamp, exact_generation, next_offset) =
             Self::compute_next_timestamp(&state, current);
@@ -247,6 +274,42 @@ pub fn duration_since_unix_epoch() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A manually advanced [`ClockSource`] for tests.
+    #[derive(Debug)]
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn new(secs: u64) -> Arc<Self> {
+            Arc::new(Self(AtomicU64::new(secs)))
+        }
+
+        fn set(&self, secs: u64) {
+            self.0.store(secs, Ordering::Relaxed);
+        }
+    }
+
+    impl ClockSource for ManualClock {
+        fn duration_since_unix_epoch(&self) -> Duration {
+            Duration::from_secs(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    #[test]
+    fn injected_clock_drives_timestamps() {
+        let clock = ManualClock::new(1_000);
+        let time = TimeManager::with_clock(500, clock.clone());
+
+        assert_eq!(time.next_timestamp(), 500);
+
+        clock.set(1_010);
+        assert_eq!(time.current_call_timestamp(), 510);
+        assert_eq!(time.next_timestamp(), 510);
+
+        time.mark_block_created();
+        assert_eq!(time.last_block_wall_time(), 1_010_000);
+    }
 
     #[test]
     fn candidate_consumes_only_its_timestamp_override() {

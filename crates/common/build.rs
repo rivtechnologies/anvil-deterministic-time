@@ -1,17 +1,13 @@
 #![expect(clippy::disallowed_macros)]
 
-use chrono::DateTime;
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::{error::Error, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let build = vergen::Build::builder().build_date(true).build_timestamp(true).build();
-    let git = vergen::Gitcl::builder().describe(false, true, None).sha(false).build();
-
-    vergen::Emitter::new().add_instructions(&build)?.add_instructions(&git)?.emit_and_set()?;
-
-    let sha = env_var("VERGEN_GIT_SHA");
+    let sha = try_env_var("VERGEN_GIT_SHA")
+        .unwrap_or_else(|| "0000000000000000000000000000000000000000".into());
     let sha_short = &sha[..10];
 
     let tag_name = try_env_var("TAG_NAME").unwrap_or_else(|| String::from("dev"));
@@ -26,8 +22,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(env_var("OUT_DIR"));
     let profile = out_dir.components().rev().nth(3).unwrap().as_os_str().to_str().unwrap();
 
-    let build_timestamp = env_var("VERGEN_BUILD_TIMESTAMP");
-    let build_timestamp_unix = DateTime::parse_from_rfc3339(&build_timestamp)?.timestamp();
+    let build_timestamp_unix =
+        try_env_var("SOURCE_DATE_EPOCH").unwrap_or_else(|| "0".into()).parse::<i64>()?;
+    let build_timestamp = DateTime::<Utc>::from_timestamp(build_timestamp_unix, 0)
+        .ok_or("SOURCE_DATE_EPOCH is outside the supported range")?
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
 
     // The SemVer compatible version information for Foundry.
     // - The latest version from Cargo.toml.

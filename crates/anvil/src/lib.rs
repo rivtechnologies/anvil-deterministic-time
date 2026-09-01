@@ -56,6 +56,7 @@ pub use config::{
 mod error;
 /// ethereum related implementations
 pub mod eth;
+pub use eth::backend::time::{ClockSource, SystemClock};
 /// Evm related abstractions
 mod evm;
 pub use evm::PrecompileFactory;
@@ -175,6 +176,7 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
         transaction_order,
         genesis,
         mixed_mining,
+        offload_blocking_tasks,
         ..
     } = config.clone();
 
@@ -237,11 +239,18 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
         logger,
         filters.clone(),
         transaction_order,
-    );
+    )
+    .with_blocking_task_offloading(offload_blocking_tasks);
 
     // spawn the node service
-    let node_service =
-        tokio::task::spawn(NodeService::new(pool, backend, miner, fee_history_service, filters));
+    let node_service = tokio::task::spawn(NodeService::new(
+        pool,
+        backend,
+        miner,
+        fee_history_service,
+        filters,
+        offload_blocking_tasks,
+    ));
 
     let mut servers = Vec::with_capacity(config.host.len());
     let mut addresses = Vec::with_capacity(config.host.len());
