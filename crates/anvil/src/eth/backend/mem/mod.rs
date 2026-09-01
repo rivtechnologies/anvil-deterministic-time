@@ -3943,13 +3943,14 @@ impl<N: Network> Backend<N> {
             states = states.disk_path(cache_path);
         }
 
-        let (slots_in_an_epoch, precompile_factory, disable_pool_balance_checks, hardfork) = {
+        let (slots_in_an_epoch, precompile_factory, disable_pool_balance_checks, hardfork, clock) = {
             let cfg = node_config.read().await;
             (
                 cfg.slots_in_an_epoch,
                 cfg.precompile_factory.clone(),
                 cfg.disable_pool_balance_checks,
                 cfg.get_hardfork(),
+                cfg.clock.clone(),
             )
         };
         let startup_cache_lease = if fork.read().is_some() {
@@ -3973,7 +3974,7 @@ impl<N: Network> Backend<N> {
             hardfork: Arc::new(RwLock::new(hardfork)),
             fork,
             last_fork_cache_source: Arc::new(RwLock::new(last_fork_cache_source)),
-            time: TimeManager::new(start_timestamp),
+            time: TimeManager::with_clock(start_timestamp, clock),
             cheats: Default::default(),
             new_block_listeners: Default::default(),
             fees,

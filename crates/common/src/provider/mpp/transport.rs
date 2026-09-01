@@ -10,7 +10,7 @@ use mpp::{
         PaymentContext, PaymentProvider, TempoAccountsProvider,
         tempo::{
             autoswap::{AutoswapConfig, DEFAULT_SLIPPAGE_BPS},
-            session::store::{SqliteChannelStore, SqliteChannelStoreOptions},
+            session::store::MemoryChannelStore,
         },
     },
     protocol::{
@@ -171,22 +171,12 @@ impl LazyAccountsProvider {
         if let Some(chain_id) = chain_id {
             provider = provider.with_expected_chain_id(chain_id);
         }
-        let request_url =
-            Url::parse(&self.origin).map_err(|error| MppError::InvalidConfig(error.to_string()))?;
-        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
-            namespace: request_url.origin().ascii_serialization(),
-            path: None,
-            request_url: Some(redacted_url(&self.origin)),
-        })
-        .map_err(|error| {
-            MppError::InvalidConfig(format!("failed to open Tempo channel store: {error}"))
-        })?;
         provider = provider
             .with_autoswap(AutoswapConfig::new(
                 crate::tempo::PATH_USD_ADDRESS,
                 DEFAULT_SLIPPAGE_BPS,
             ))
-            .with_session_store(Arc::new(store))
+            .with_session_store(Arc::new(MemoryChannelStore::default()))
             .with_session_default_deposit(DEFAULT_MPP_SESSION_DEPOSIT)
             .with_session_top_up_amount(DEFAULT_MPP_SESSION_DEPOSIT)
             .with_session_max_deposit(MAX_MPP_SESSION_DEPOSIT);

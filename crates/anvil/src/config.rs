@@ -8,7 +8,7 @@ use crate::{
             },
             genesis::GenesisConfig,
             mem::fork_db::ForkedDatabase,
-            time::duration_since_unix_epoch,
+            time::{ClockSource, SystemClock},
         },
         fees::{INITIAL_BASE_FEE, INITIAL_GAS_PRICE},
         pool::transactions::TransactionOrder,
@@ -285,6 +285,11 @@ pub struct NodeConfig {
     pub memory_limit: Option<u64>,
     /// Factory used by `anvil` to extend the EVM's precompiles.
     pub precompile_factory: Option<Arc<dyn PrecompileFactory>>,
+    /// Source of wall-clock time for the node; defaults to the system clock.
+    pub clock: Arc<dyn ClockSource>,
+    /// Whether CPU-heavy work is offloaded to Tokio's blocking pool.
+    /// Disable when the current runtime must retain scheduling authority.
+    pub offload_blocking_tasks: bool,
     /// Networks to enable features for.
     pub networks: NetworkConfigs,
     /// The account used to sponsor Tempo fee-payer requests.
@@ -630,6 +635,8 @@ impl Default for NodeConfig {
             slots_in_an_epoch: DEFAULT_SLOTS_IN_AN_EPOCH,
             memory_limit: None,
             precompile_factory: None,
+            clock: Arc::new(SystemClock),
+            offload_blocking_tasks: true,
             networks: Default::default(),
             tempo_fee_payer: None,
             silent: false,
@@ -886,7 +893,7 @@ impl NodeConfig {
     pub fn get_genesis_timestamp(&self) -> u64 {
         self.genesis_timestamp
             .or_else(|| self.genesis.as_ref().map(|g| g.timestamp))
-            .unwrap_or_else(|| duration_since_unix_epoch().as_secs())
+            .unwrap_or_else(|| self.clock.duration_since_unix_epoch().as_secs())
     }
 
     /// Sets the genesis timestamp
@@ -1230,6 +1237,25 @@ impl NodeConfig {
     #[must_use]
     pub fn with_precompile_factory(mut self, factory: impl PrecompileFactory + 'static) -> Self {
         self.precompile_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Sets the clock the node reads the current time from.
+    ///
+    /// All derived timestamps (genesis fallback, block and call timestamps, time offsets) go
+    /// through this clock, so embedders can inject a simulated clock for deterministic simulation
+    /// testing.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl ClockSource + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Sets whether CPU-heavy work is offloaded to Tokio's blocking pool.
+    /// Disable when the current runtime must retain scheduling authority.
+    #[must_use]
+    pub const fn with_blocking_task_offloading(mut self, enabled: bool) -> Self {
+        self.offload_blocking_tasks = enabled;
         self
     }
 
